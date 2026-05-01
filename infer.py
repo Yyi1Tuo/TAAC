@@ -65,6 +65,8 @@ _FALLBACK_MODEL_CFG = {
     'rope_base': 10000.0,
     'emb_skip_threshold': 0,
     'seq_id_threshold': 10000,
+    'use_context_time_features': False,
+    'context_time_dim': 5,
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
@@ -296,6 +298,7 @@ def _batch_to_model_input(
         user_int_feats=device_batch['user_int_feats'],
         item_int_feats=device_batch['item_int_feats'],
         user_dense_feats=device_batch['user_dense_feats'],
+        context_time_feats=device_batch['context_time_feats'],
         item_dense_feats=device_batch['item_dense_feats'],
         seq_data=seq_data,
         seq_lens=seq_lens,
@@ -340,6 +343,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        time_utc_offset_hours=int(train_config.get('time_utc_offset_hours', 8)),
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")

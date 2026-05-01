@@ -12,6 +12,7 @@ class ModelInput(NamedTuple):
     user_int_feats: torch.Tensor
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
+    context_time_feats: torch.Tensor
     item_dense_feats: torch.Tensor
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
@@ -1040,6 +1041,8 @@ class GroupNSTokenizer(nn.Module):
         Returns:
             Tokens of shape (B, num_groups, D).
         """
+        # Cast once: downstream lookups all need int64 indices.
+        int_feats_long = int_feats.long()
         tokens = []
         for group, proj in zip(self.groups, self.group_projs):
             fid_embs = []
@@ -1053,14 +1056,17 @@ class GroupNSTokenizer(nn.Module):
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
                         # Single-value feature: direct lookup
-                        fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
+                        fid_emb = emb_layer(int_feats_long[:, offset])  # (B, emb_dim)
                     else:
-                        # Multi-value feature: lookup then mean pooling (ignoring padding=0)
-                        vals = int_feats[:, offset:offset + length].long()  # (B, length)
+                        # Multi-value feature: lookup then mean pooling.
+                        # nn.Embedding(padding_idx=0) already returns zero
+                        # vectors at padding positions, so the explicit
+                        # mask multiplication is redundant; we only need
+                        # the valid count for the mean denominator.
+                        vals = int_feats_long[:, offset:offset + length]  # (B, length)
                         emb_all = emb_layer(vals)  # (B, length, emb_dim)
-                        mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
-                        count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
+                        count = (vals != 0).sum(dim=1, keepdim=True).clamp(min=1)
+                        fid_emb = emb_all.sum(dim=1) / count  # (B, emb_dim)
                 fid_embs.append(fid_emb)
             cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
             tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
@@ -1155,6 +1161,8 @@ class RankMixerNSTokenizer(nn.Module):
             (B, num_ns_tokens, d_model) tensor.
         """
         # 1. Embed all fids in group order → flat cat
+        # Cast int_feats once; downstream lookups all need int64 indices.
+        int_feats_long = int_feats.long()
         all_embs = []
         for group in self.groups:
             for fid_idx in group:
@@ -1165,13 +1173,15 @@ class RankMixerNSTokenizer(nn.Module):
                 else:
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
-                        fid_emb = emb_layer(int_feats[:, offset].long())
+                        fid_emb = emb_layer(int_feats_long[:, offset])
                     else:
-                        vals = int_feats[:, offset:offset + length].long()
+                        # padding_idx=0 already zeros padding positions in
+                        # the embedding lookup, so we only need the valid
+                        # count for the mean denominator (no mask multiply).
+                        vals = int_feats_long[:, offset:offset + length]
                         emb_all = emb_layer(vals)
-                        mask = (vals != 0).float().unsqueeze(-1)
-                        count = mask.sum(dim=1).clamp(min=1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                        count = (vals != 0).sum(dim=1, keepdim=True).clamp(min=1)
+                        fid_emb = emb_all.sum(dim=1) / count
                 all_embs.append(fid_emb)
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
@@ -1225,6 +1235,8 @@ class PCVRHyFormer(nn.Module):
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
+        use_context_time_features: bool = False,
+        context_time_dim: int = 5,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1243,6 +1255,8 @@ class PCVRHyFormer(nn.Module):
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
+        self.use_context_time_features = use_context_time_features
+        self.context_time_dim = context_time_dim
         self.ns_tokenizer_type = ns_tokenizer_type
 
         # ================== NS Tokens Construction ==================
@@ -1308,6 +1322,12 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             self.item_dense_proj = nn.Sequential(
                 nn.Linear(item_dense_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+
+        if use_context_time_features and context_time_dim > 0:
+            self.context_time_proj = nn.Sequential(
+                nn.Linear(context_time_dim, d_model),
                 nn.LayerNorm(d_model),
             )
 
@@ -1552,16 +1572,20 @@ class PCVRHyFormer(nn.Module):
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
+        # Single split into S views avoids S separate slicing kernels.
+        seq_views = seq.unbind(dim=1)  # tuple of S tensors, each (B, L)
+        apply_id_dropout = self.training
         emb_list = []
         for i in range(S):
             real_idx = emb_index[i] if i < len(emb_index) else -1
             if real_idx == -1:
-                # Feature skipped by emb_skip_threshold: output zero vector
+                # Feature skipped by emb_skip_threshold: output zero vector.
+                # Using float dtype to match emb output; allocated lazily here
+                # to keep the broadcast shape correct in the cat below.
                 emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
             else:
-                emb = sideinfo_embs[real_idx]
-                e = emb(seq[:, i, :])  # (B, L, emb_dim)
-                if is_id[i] and self.training:
+                e = sideinfo_embs[real_idx](seq_views[i])  # (B, L, emb_dim)
+                if is_id[i] and apply_id_dropout:
                     e = self.seq_id_emb_dropout(e)
                 emb_list.append(e)
         cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
@@ -1636,6 +1660,9 @@ class PCVRHyFormer(nn.Module):
         # 1. NS tokens: grouped projection
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
+        context_time_bias = None
+        if self.use_context_time_features and self.context_time_dim > 0:
+            context_time_bias = F.silu(self.context_time_proj(inputs.context_time_feats))
 
         ns_parts = [user_ns]
         if self.has_user_dense:
@@ -1647,6 +1674,8 @@ class PCVRHyFormer(nn.Module):
             ns_parts.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        if context_time_bias is not None:
+            ns_tokens = ns_tokens + context_time_bias.unsqueeze(1)
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1669,6 +1698,8 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training
         )
+        if context_time_bias is not None:
+            output = output + context_time_bias
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1679,6 +1710,9 @@ class PCVRHyFormer(nn.Module):
         # Reuses forward logic but without dropout
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
+        context_time_bias = None
+        if self.use_context_time_features and self.context_time_dim > 0:
+            context_time_bias = F.silu(self.context_time_proj(inputs.context_time_feats))
 
         ns_parts = [user_ns]
         if self.has_user_dense:
@@ -1690,6 +1724,8 @@ class PCVRHyFormer(nn.Module):
             ns_parts.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
+        if context_time_bias is not None:
+            ns_tokens = ns_tokens + context_time_bias.unsqueeze(1)
 
         seq_tokens_list = []
         seq_masks_list = []
@@ -1709,6 +1745,8 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+        if context_time_bias is not None:
+            output = output + context_time_bias
 
         logits = self.clsfier(output)
         return logits, output

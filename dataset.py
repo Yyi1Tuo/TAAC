@@ -130,6 +130,7 @@ BUCKET_BOUNDARIES = np.array([
 # That is why ``train.py`` / ``infer.py`` only expose the boolean flag
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
+NUM_CONTEXT_TIME_FEATS = 5
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -153,6 +154,9 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        timestamp_split: Optional[int] = None,
+        use_ge_timestamp: bool = False,
+        time_utc_offset_hours: int = 8,
     ) -> None:
         """
         Args:
@@ -170,6 +174,14 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            timestamp_split: optional split boundary on the top-level
+                ``timestamp`` column. When set, only rows satisfying the
+                requested side of the split are yielded.
+            use_ge_timestamp: when ``timestamp_split`` is set, keep rows whose
+                ``timestamp >= timestamp_split`` if True, else keep rows whose
+                ``timestamp < timestamp_split``.
+            time_utc_offset_hours: timezone offset used when converting the
+                top-level unix ``timestamp`` into cyclic hour/week features.
         """
         super().__init__()
 
@@ -188,6 +200,9 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.timestamp_split = timestamp_split
+        self.use_ge_timestamp = use_ge_timestamp
+        self.time_utc_offset_hours = int(time_utc_offset_hours)
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -218,6 +233,7 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_int = np.zeros((B, self.user_int_schema.total_dim), dtype=np.int64)
         self._buf_item_int = np.zeros((B, self.item_int_schema.total_dim), dtype=np.int64)
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
+        self._buf_context_time = np.zeros((B, NUM_CONTEXT_TIME_FEATS), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
         self._buf_seq_lens = {}
@@ -346,6 +362,9 @@ class PCVRParquetDataset(IterableDataset):
             pf = pq.ParquetFile(file_path)
             for batch in pf.iter_batches(batch_size=self.batch_size, row_groups=[rg_idx]):
                 batch_dict = self._convert_batch(batch)
+                batch_dict = self._filter_batch_by_timestamp(batch_dict)
+                if batch_dict is None:
+                    continue
                 if self.shuffle and self.buffer_batches > 1:
                     buffer.append(batch_dict)
                     if len(buffer) >= self.buffer_batches:
@@ -382,6 +401,36 @@ class PCVRParquetDataset(IterableDataset):
             yield batch
         del merged
         buffer.clear()
+
+    def _filter_batch_by_timestamp(
+        self,
+        batch: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Apply an optional timestamp-based row filter to one batch."""
+        if self.timestamp_split is None:
+            return batch
+
+        timestamps = batch['timestamp']
+        if self.use_ge_timestamp:
+            keep_mask = timestamps >= self.timestamp_split
+        else:
+            keep_mask = timestamps < self.timestamp_split
+
+        if bool(keep_mask.all()):
+            return batch
+        if not bool(keep_mask.any()):
+            return None
+
+        filtered: Dict[str, Any] = {}
+        keep_idx = keep_mask.nonzero(as_tuple=False).view(-1).tolist()
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                filtered[key] = value[keep_mask]
+            elif key == 'user_id' and isinstance(value, list):
+                filtered[key] = [value[i] for i in keep_idx]
+            else:
+                filtered[key] = value
+        return filtered
 
     # ---- Helpers ----
 
@@ -442,6 +491,63 @@ class PCVRParquetDataset(IterableDataset):
         else:
             logging.info(msg)
 
+    @staticmethod
+    def _scatter_varlen_2d(
+        offsets: "npt.NDArray[np.int64]",
+        values: "npt.NDArray[Any]",
+        out: "npt.NDArray[Any]",
+        max_len: int,
+        B: int,
+    ) -> "npt.NDArray[np.int64]":
+        """Vectorized scatter of an Arrow ``ListArray`` into a pre-allocated
+        ``[B, max_len]`` buffer.
+
+        Equivalent to::
+
+            for i in range(B):
+                start, end = offsets[i], offsets[i + 1]
+                use_len = min(end - start, max_len)
+                if use_len > 0:
+                    out[i, :use_len] = values[start:start + use_len]
+
+        but executed entirely in numpy without a Python loop. ``out`` must be
+        pre-zeroed by the caller; this function only writes the valid region.
+
+        Args:
+            offsets: Arrow list offsets, length ``B + 1``.
+            values: Flat Arrow values buffer.
+            out: Pre-allocated output of shape ``[B, max_len]``; written in
+                place. Tail positions ``out[i, lengths[i]:]`` are left as-is.
+            max_len: Truncation length per row.
+            B: Number of rows in the batch.
+
+        Returns:
+            ``lengths`` of shape ``[B]`` with the post-truncation valid length
+            for every row (``int64``).
+        """
+        # raw lengths per row, truncated to max_len
+        raw_lens = (offsets[1:] - offsets[:-1]).astype(np.int64, copy=False)
+        lengths = np.minimum(raw_lens, max_len)
+
+        total = int(lengths.sum())
+        if total == 0:
+            return lengths
+
+        # row index for every flat-output element
+        row_idx = np.repeat(np.arange(B, dtype=np.int64), lengths)
+        # column index = position within each row, i.e. 0..lengths[i]-1
+        # cumulative offset of each row's start in the flat layout
+        cum = np.empty(B, dtype=np.int64)
+        cum[0] = 0
+        if B > 1:
+            np.cumsum(lengths[:-1], out=cum[1:])
+        col_idx = np.arange(total, dtype=np.int64) - cum[row_idx]
+        # source index in the flat values buffer
+        src_idx = offsets[:-1].astype(np.int64, copy=False)[row_idx] + col_idx
+
+        out[row_idx, col_idx] = values[src_idx]
+        return lengths
+
     def _pad_varlen_int_column(
         self,
         arrow_col: "pa.ListArray",
@@ -461,16 +567,7 @@ class PCVRParquetDataset(IterableDataset):
         values = arrow_col.values.to_numpy()
 
         padded = np.zeros((B, max_len), dtype=np.int64)
-        lengths = np.zeros(B, dtype=np.int64)
-
-        for i in range(B):
-            start, end = int(offsets[i]), int(offsets[i + 1])
-            raw_len = end - start
-            if raw_len <= 0:
-                continue
-            use_len = min(raw_len, max_len)
-            padded[i, :use_len] = values[start:start + use_len]
-            lengths[i] = use_len
+        lengths = self._scatter_varlen_2d(offsets, values, padded, max_len, B)
 
         padded[padded <= 0] = 0
         return padded, lengths
@@ -491,16 +588,47 @@ class PCVRParquetDataset(IterableDataset):
         values = arrow_col.values.to_numpy()
 
         padded = np.zeros((B, max_dim), dtype=np.float32)
-
-        for i in range(B):
-            start, end = int(offsets[i]), int(offsets[i + 1])
-            raw_len = end - start
-            if raw_len <= 0:
-                continue
-            use_len = min(raw_len, max_dim)
-            padded[i, :use_len] = values[start:start + use_len]
-
+        self._scatter_varlen_2d(offsets, values, padded, max_dim, B)
         return padded
+
+    def _build_context_time_feats(
+        self,
+        timestamps: "npt.NDArray[np.int64]",
+        B: int,
+    ) -> "npt.NDArray[np.float32]":
+        """Build robust cyclic time features from the top-level timestamp.
+
+        Features:
+        1. hour-of-day sin
+        2. hour-of-day cos
+        3. week-phase sin
+        4. week-phase cos
+        5. weekend indicator
+
+        The cyclic encoding is deliberate: train covers Tuesday-Sunday while
+        test includes Sunday/Monday, so a continuous phase representation
+        generalizes better than unseen discrete weekday ids.
+        """
+        out = self._buf_context_time[:B]
+        out[:] = 0.0
+
+        ts_local = timestamps.astype(np.int64, copy=False) + self.time_utc_offset_hours * 3600
+        sec_of_day = np.mod(ts_local, 86400).astype(np.float32, copy=False)
+        sec_of_week = np.mod(ts_local, 7 * 86400).astype(np.float32, copy=False)
+
+        hour_phase = sec_of_day * (2.0 * np.pi / 86400.0)
+        week_phase = sec_of_week * (2.0 * np.pi / (7.0 * 86400.0))
+
+        day_idx = np.floor_divide(ts_local, 86400)
+        # Monday=0, ..., Sunday=6. 1970-01-01 is Thursday.
+        dow = np.mod(day_idx + 3, 7)
+
+        out[:, 0] = np.sin(hour_phase)
+        out[:, 1] = np.cos(hour_phase)
+        out[:, 2] = np.sin(week_phase)
+        out[:, 3] = np.cos(week_phase)
+        out[:, 4] = (dow >= 5).astype(np.float32, copy=False)
+        return out
 
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
@@ -569,10 +697,12 @@ class PCVRParquetDataset(IterableDataset):
             col = batch.column(ci)
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
+        context_time_feats = self._build_context_time_feats(timestamps, B)
 
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
+            'context_time_feats': torch.from_numpy(context_time_feats.copy()),
             'item_int_feats': torch.from_numpy(item_int.copy()),
             'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
             'label': torch.from_numpy(labels),
@@ -592,24 +722,17 @@ class PCVRParquetDataset(IterableDataset):
             lengths = self._buf_seq_lens[domain][:B]
             lengths[:] = 0
 
-            # Fused path: first collect (offsets, values, vocab_size, col_idx)
-            # for every side-info column, then fill the buffer in a single pass.
-            col_data = []
-            for ci, slot, vs in side_plan:
+            # Fused path: vectorized scatter for every side-info column in a
+            # single pass; the per-column lengths are reduced via element-wise
+            # max into the shared `lengths` buffer.
+            for c, (ci, _slot, _vs) in enumerate(side_plan):
                 col = batch.column(ci)
-                col_data.append((col.offsets.to_numpy(), col.values.to_numpy(), vs, ci))
-
-            for c, (offs, vals, vs, ci) in enumerate(col_data):
-                for i in range(B):
-                    s = int(offs[i])
-                    e = int(offs[i + 1])
-                    rl = e - s
-                    if rl <= 0:
-                        continue
-                    ul = min(rl, max_len)
-                    out[i, c, :ul] = vals[s:s + ul]
-                    if ul > lengths[i]:
-                        lengths[i] = ul
+                offs = col.offsets.to_numpy()
+                vals = col.values.to_numpy()
+                col_lens = self._scatter_varlen_2d(
+                    offs, vals, out[:, c, :], max_len, B)
+                # lengths[i] := max over columns of per-column length
+                np.maximum(lengths, col_lens, out=lengths)
 
             # Values <= 0 -> 0.
             out[out <= 0] = 0
@@ -617,7 +740,7 @@ class PCVRParquetDataset(IterableDataset):
             # Check out-of-bound values per feature's vocab_size.
             # vs==0 means no vocab info; force the whole slice to 0 so that
             # the model's 1-slot Embedding is never indexed out of range.
-            for c, (_, _, vs, ci) in enumerate(col_data):
+            for c, (ci, _slot, vs) in enumerate(side_plan):
                 slice_c = out[:, c, :]
                 if vs > 0:
                     self._record_oob(f'seq_{domain}', ci, slice_c, vs)
@@ -634,16 +757,10 @@ class PCVRParquetDataset(IterableDataset):
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
-                # Pad timestamps into shape (B, max_len).
+                # Pad timestamps into shape (B, max_len) via vectorized scatter.
                 ts_padded = np.zeros((B, max_len), dtype=np.int64)
-                for i in range(B):
-                    s = int(ts_offs[i])
-                    e = int(ts_offs[i + 1])
-                    rl = e - s
-                    if rl <= 0:
-                        continue
-                    ul = min(rl, max_len)
-                    ts_padded[i, :ul] = ts_vals[s:s + ul]
+                self._scatter_varlen_2d(
+                    ts_offs, ts_vals, ts_padded, max_len, B)
 
                 ts_expanded = timestamps.reshape(-1, 1)
                 time_diff = np.maximum(ts_expanded - ts_padded, 0)
@@ -675,18 +792,26 @@ def get_pcvr_data(
     batch_size: int = 256,
     valid_ratio: float = 0.1,
     train_ratio: float = 1.0,
+    split_timestamp: Optional[int] = None,
+    time_utc_offset_hours: int = 8,
     num_workers: int = 16,
     buffer_batches: int = 20,
     shuffle_train: bool = True,
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    prefetch_factor: int = 4,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
-    The validation split is taken as the last ``valid_ratio`` fraction of Row
-    Groups (in the file order returned by ``glob``).
+    When ``split_timestamp`` is set, the split is applied on the top-level
+    sample ``timestamp`` column:
+      - train: ``timestamp < split_timestamp``
+      - valid: ``timestamp >= split_timestamp``
+
+    Otherwise, the validation split is taken as the last ``valid_ratio``
+    fraction of Row Groups (in the file order returned by ``glob``).
 
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. The third
@@ -706,19 +831,33 @@ def get_pcvr_data(
             rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
     total_rgs = len(rg_info)
 
-    n_valid_rgs = max(1, int(total_rgs * valid_ratio))
-    n_train_rgs = total_rgs - n_valid_rgs
+    if split_timestamp is None:
+        n_valid_rgs = max(1, int(total_rgs * valid_ratio))
+        n_train_rgs = total_rgs - n_valid_rgs
 
-    # train_ratio: use only the first N% of the training Row Groups.
-    if train_ratio < 1.0:
-        n_train_rgs = max(1, int(n_train_rgs * train_ratio))
-        logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
+        # train_ratio: use only the first N% of the training Row Groups.
+        if train_ratio < 1.0:
+            n_train_rgs = max(1, int(n_train_rgs * train_ratio))
+            logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
 
-    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+        train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
+        valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+        train_rg_range = (0, n_train_rgs)
+        valid_rg_range = (n_train_rgs, total_rgs)
 
-    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                 f"{n_valid_rgs} valid ({valid_rows} rows)")
+        logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+                     f"{n_valid_rgs} valid ({valid_rows} rows)")
+    else:
+        n_train_rgs = total_rgs
+        train_rows = sum(r[2] for r in rg_info)
+        valid_rows = train_rows
+        train_rg_range = None
+        valid_rg_range = None
+        logging.info(
+            "Timestamp split enabled: train timestamp < %s, valid timestamp >= %s",
+            split_timestamp,
+            split_timestamp,
+        )
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -727,19 +866,33 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
-        row_group_range=(0, n_train_rgs),
+        row_group_range=train_rg_range,
         clip_vocab=clip_vocab,
+        timestamp_split=split_timestamp,
+        use_ge_timestamp=False,
+        time_utc_offset_hours=time_utc_offset_hours,
     )
+
+    # Cap num_workers at the number of training Row Groups: when there are
+    # more workers than RGs, the i % num_workers shard inside __iter__ leaves
+    # extra workers permanently empty, which (combined with persistent_workers)
+    # silently halves throughput once the busy workers have drained their RGs.
+    effective_train_workers = min(num_workers, max(1, n_train_rgs))
+    if effective_train_workers != num_workers:
+        logging.info(
+            f"DataLoader num_workers capped: requested={num_workers}, "
+            f"effective={effective_train_workers} (n_train_rgs={n_train_rgs})"
+        )
 
     use_cuda = torch.cuda.is_available()
     _train_kw = {}
-    if num_workers > 0:
+    if effective_train_workers > 0:
         _train_kw['persistent_workers'] = True
-        _train_kw['prefetch_factor'] = 2
+        _train_kw['prefetch_factor'] = max(1, int(prefetch_factor))
 
     train_loader = DataLoader(
         train_dataset, batch_size=None,
-        num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
+        num_workers=effective_train_workers, pin_memory=use_cuda, **_train_kw,
     )
 
     valid_dataset = PCVRParquetDataset(
@@ -749,8 +902,11 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=False,
         buffer_batches=0,
-        row_group_range=(n_train_rgs, total_rgs),
+        row_group_range=valid_rg_range,
         clip_vocab=clip_vocab,
+        timestamp_split=split_timestamp,
+        use_ge_timestamp=True,
+        time_utc_offset_hours=time_utc_offset_hours,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

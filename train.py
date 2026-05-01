@@ -78,6 +78,14 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of training Row Groups to use (takes the first N%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
+    parser.add_argument('--split_timestamp', type=int, default=1774220924,
+                        help='Split train/valid by top-level timestamp: '
+                             'train uses timestamp < this value, '
+                             'valid uses timestamp >= this value. '
+                             'Set to 0 or a negative value to fall back to row-group ratios.')
+    parser.add_argument('--time_utc_offset_hours', type=int, default=8,
+                        help='UTC offset used to derive cyclic time features '
+                             'from the top-level timestamp.')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -144,6 +152,28 @@ def parse_args() -> argparse.Namespace:
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
 
+    # ---- Speed knobs (no impact on AUC besides AMP, which is near-lossless) ----
+    parser.add_argument('--use_amp', action='store_true', default=False,
+                        help='Enable mixed-precision training (autocast). '
+                             'Auto-uses bfloat16 when supported (no GradScaler), '
+                             'else falls back to float16 with GradScaler. '
+                             'Has no effect on CPU or when CUDA is unavailable.')
+    parser.add_argument('--amp_dtype', type=str, default='bfloat16',
+                        choices=['bfloat16', 'float16'],
+                        help='Preferred AMP dtype when --use_amp is set.')
+    parser.add_argument('--use_tf32', action='store_true', default=False,
+                        help='Enable TF32 matmul on Ampere+ GPUs '
+                             '(torch.set_float32_matmul_precision=high).')
+    parser.add_argument('--grad_clip_foreach', action='store_true', default=False,
+                        help='Use the foreach implementation of clip_grad_norm_ '
+                             '(faster but historically tripped a CUDA kernel '
+                             'bug for some shapes; default off for safety).')
+    parser.add_argument('--tqdm_min_interval', type=float, default=0.0,
+                        help='Minimum tqdm refresh interval in seconds; '
+                             '>0 throttles per-step terminal writes (default 0=off).')
+    parser.add_argument('--prefetch_factor', type=int, default=4,
+                        help='DataLoader prefetch_factor when num_workers>0.')
+
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
                         help='Learning rate for sparse parameters (Adagrad over Embeddings)')
@@ -173,6 +203,11 @@ def parse_args() -> argparse.Namespace:
                              'extra dropout(rate*2) during training to reduce overfitting. '
                              'Features at or below this threshold are treated as side-info '
                              'and receive no extra dropout.')
+    parser.add_argument('--use_context_time_features', action='store_true', default=True,
+                        help='Enable cyclic context time features derived from '
+                             'the top-level timestamp (default on).')
+    parser.add_argument('--no_context_time_features', dest='use_context_time_features', action='store_false',
+                        help='Disable cyclic context time features.')
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -239,17 +274,29 @@ def main() -> None:
         logging.info(f"Seq max_lens override: {seq_max_lens}")
 
     logging.info("Using Parquet data format (IterableDataset)")
+    split_timestamp = args.split_timestamp if args.split_timestamp and args.split_timestamp > 0 else None
     train_loader, valid_loader, pcvr_dataset = get_pcvr_data(
         data_dir=args.data_dir,
         schema_path=schema_path,
         batch_size=args.batch_size,
         valid_ratio=args.valid_ratio,
         train_ratio=args.train_ratio,
+        split_timestamp=split_timestamp,
+        time_utc_offset_hours=args.time_utc_offset_hours,
         num_workers=args.num_workers,
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        prefetch_factor=args.prefetch_factor,
     )
+
+    # Enable TF32 matmul (Ampere+) for a free dense-matmul speedup. Only
+    # affects float32 ops; AMP / bfloat16 paths are independent.
+    if args.use_tf32:
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logging.info("TF32 matmul enabled (high precision mode)")
 
     # ---- NS groups ----
     if args.ns_groups_json and os.path.exists(args.ns_groups_json):
@@ -298,6 +345,8 @@ def main() -> None:
         "rope_base": args.rope_base,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
+        "use_context_time_features": args.use_context_time_features,
+        "context_time_dim": 5,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
@@ -350,6 +399,10 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        use_amp=args.use_amp,
+        amp_dtype=args.amp_dtype,
+        grad_clip_foreach=args.grad_clip_foreach,
+        tqdm_min_interval=args.tqdm_min_interval,
     )
 
     trainer.train()
