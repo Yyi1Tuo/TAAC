@@ -78,14 +78,16 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of training Row Groups to use (takes the first N%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
-    parser.add_argument('--split_timestamp', type=int, default=1774220924,
-                        help='Split train/valid by top-level timestamp: '
-                             'train uses timestamp < this value, '
-                             'valid uses timestamp >= this value. '
-                             'Set to 0 or a negative value to fall back to row-group ratios.')
-    parser.add_argument('--time_utc_offset_hours', type=int, default=8,
-                        help='UTC offset used to derive cyclic time features '
-                             'from the top-level timestamp.')
+    parser.add_argument('--time_aware_split', action='store_true', default=True,
+                        help='Sort Row Groups by their min timestamp before '
+                             'splitting train/valid; train takes the earliest '
+                             'part and valid takes the most recent tail. '
+                             'Eliminates temporal leakage caused by '
+                             'filename-lexicographic ordering. Default on.')
+    parser.add_argument('--no_time_aware_split', dest='time_aware_split',
+                        action='store_false',
+                        help='Disable time-aware splitting and fall back to '
+                             'filename-lexicographic Row Group order.')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -203,11 +205,10 @@ def parse_args() -> argparse.Namespace:
                              'extra dropout(rate*2) during training to reduce overfitting. '
                              'Features at or below this threshold are treated as side-info '
                              'and receive no extra dropout.')
-    parser.add_argument('--use_context_time_features', action='store_true', default=True,
-                        help='Enable cyclic context time features derived from '
-                             'the top-level timestamp (default on).')
-    parser.add_argument('--no_context_time_features', dest='use_context_time_features', action='store_false',
-                        help='Disable cyclic context time features.')
+    parser.add_argument('--use_pair_tokens', action='store_true', default=True,
+                        help='Enable explicit user-item and item-sequence pair tokens (default on).')
+    parser.add_argument('--no_pair_tokens', dest='use_pair_tokens', action='store_false',
+                        help='Disable explicit pair tokens.')
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -274,20 +275,18 @@ def main() -> None:
         logging.info(f"Seq max_lens override: {seq_max_lens}")
 
     logging.info("Using Parquet data format (IterableDataset)")
-    split_timestamp = args.split_timestamp if args.split_timestamp and args.split_timestamp > 0 else None
     train_loader, valid_loader, pcvr_dataset = get_pcvr_data(
         data_dir=args.data_dir,
         schema_path=schema_path,
         batch_size=args.batch_size,
         valid_ratio=args.valid_ratio,
         train_ratio=args.train_ratio,
-        split_timestamp=split_timestamp,
-        time_utc_offset_hours=args.time_utc_offset_hours,
         num_workers=args.num_workers,
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
         prefetch_factor=args.prefetch_factor,
+        time_aware_split=args.time_aware_split,
     )
 
     # Enable TF32 matmul (Ampere+) for a free dense-matmul speedup. Only
@@ -325,6 +324,7 @@ def main() -> None:
         "item_int_feature_specs": item_int_feature_specs,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
+        "engineered_dense_dim": pcvr_dataset.engineered_dense_dim,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
@@ -345,8 +345,7 @@ def main() -> None:
         "rope_base": args.rope_base,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
-        "use_context_time_features": args.use_context_time_features,
-        "context_time_dim": 5,
+        "use_pair_tokens": args.use_pair_tokens,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,

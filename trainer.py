@@ -439,7 +439,7 @@ class PCVRHyFormerRankingTrainer:
             user_int_feats=device_batch['user_int_feats'],
             item_int_feats=device_batch['item_int_feats'],
             user_dense_feats=device_batch['user_dense_feats'],
-            context_time_feats=device_batch['context_time_feats'],
+            engineered_dense_feats=device_batch['engineered_dense_feats'],
             item_dense_feats=device_batch['item_dense_feats'],
             seq_data=seq_data,
             seq_lens=seq_lens,
@@ -462,7 +462,7 @@ class PCVRHyFormerRankingTrainer:
         # by PyTorch (they always return float32) so optimizer state for
         # Adagrad-managed sparse params is unaffected.
         if self.use_amp:
-            with torch.amp.autocast(device_type='cuda', dtype=self._amp_dtype):
+            with torch.cuda.amp.autocast(dtype=self._amp_dtype):
                 logits = self.model(model_input).squeeze(-1)
                 if self.loss_type == 'focal':
                     loss = sigmoid_focal_loss(

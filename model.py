@@ -12,7 +12,7 @@ class ModelInput(NamedTuple):
     user_int_feats: torch.Tensor
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
-    context_time_feats: torch.Tensor
+    engineered_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
@@ -1213,6 +1213,7 @@ class PCVRHyFormer(nn.Module):
         item_int_feature_specs: List[Tuple[int, int, int]],
         user_dense_dim: int,
         item_dense_dim: int,
+        engineered_dense_dim: int,
         seq_vocab_sizes: "dict[str, List[int]]",  # {domain: [vocab_size_per_fid, ...]}
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
@@ -1235,8 +1236,7 @@ class PCVRHyFormer(nn.Module):
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
-        use_context_time_features: bool = False,
-        context_time_dim: int = 5,
+        use_pair_tokens: bool = True,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1255,8 +1255,7 @@ class PCVRHyFormer(nn.Module):
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
-        self.use_context_time_features = use_context_time_features
-        self.context_time_dim = context_time_dim
+        self.use_pair_tokens = use_pair_tokens
         self.ns_tokenizer_type = ns_tokenizer_type
 
         # ================== NS Tokens Construction ==================
@@ -1325,25 +1324,49 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
-        if use_context_time_features and context_time_dim > 0:
-            self.context_time_proj = nn.Sequential(
-                nn.Linear(context_time_dim, d_model),
+        self.has_engineered_dense = engineered_dense_dim > 0
+        if self.has_engineered_dense:
+            self.engineered_dense_proj = nn.Sequential(
+                nn.Linear(engineered_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
 
+        self.num_pair_tokens = 0
+        if self.use_pair_tokens:
+            pair_in_dim = d_model * 4
+            self.user_item_pair_proj = nn.Sequential(
+                nn.Linear(pair_in_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+            self.item_seq_pair_projs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(pair_in_dim, d_model),
+                    nn.LayerNorm(d_model),
+                )
+                for _ in range(self.num_sequences)
+            ])
+            self.num_pair_tokens = 1 + self.num_sequences
+
         # Total NS token count
-        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+        self.num_ns = (
+            num_user_ns
+            + (1 if self.has_user_dense else 0)
+            + num_item_ns
+            + (1 if self.has_item_dense else 0)
+            + (1 if self.has_engineered_dense else 0)
+            + self.num_pair_tokens
+        )
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
         if rank_mixer_mode == 'full' and d_model % T != 0:
-            valid_T_values = [t for t in range(1, d_model + 1) if d_model % t == 0]
-            raise ValueError(
-                f"d_model={d_model} must be divisible by T=num_queries*num_sequences+num_ns="
-                f"{num_queries}*{self.num_sequences}+{self.num_ns}={T}. "
-                f"Valid T values for d_model={d_model}: {valid_T_values}"
+            logging.warning(
+                "rank_mixer_mode=full requires d_model %% T == 0, but got "
+                "d_model=%s and T=%s. Falling back to rank_mixer_mode=ffn_only.",
+                d_model, T,
             )
+            rank_mixer_mode = 'ffn_only'
+            self.rank_mixer_mode = rank_mixer_mode
 
         # ================== Seq Tokens Embedding ==================
         # seq_id_threshold decides which features inside the seq tokenizer are
@@ -1655,14 +1678,58 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
+    @staticmethod
+    def _masked_mean(
+        seq_tokens: torch.Tensor,
+        seq_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mean-pool sequence tokens over valid positions only."""
+        valid = (~seq_mask).unsqueeze(-1).float()
+        seq_sum = (seq_tokens * valid).sum(dim=1)
+        seq_count = valid.sum(dim=1).clamp(min=1.0)
+        return seq_sum / seq_count
+
+    def _build_pair_tokens(
+        self,
+        user_ns: torch.Tensor,
+        item_ns: torch.Tensor,
+        seq_tokens_list: list,
+        seq_masks_list: list,
+    ) -> list:
+        """Construct explicit user-item and item-sequence interaction tokens."""
+        if not self.use_pair_tokens:
+            return []
+
+        user_summary = user_ns.mean(dim=1)
+        item_summary = item_ns.mean(dim=1)
+
+        ui_pair = torch.cat([
+            user_summary,
+            item_summary,
+            user_summary * item_summary,
+            torch.abs(user_summary - item_summary),
+        ], dim=-1)
+        pair_tokens = [F.silu(self.user_item_pair_proj(ui_pair)).unsqueeze(1)]
+
+        for seq_tokens, seq_mask, proj in zip(
+            seq_tokens_list, seq_masks_list, self.item_seq_pair_projs
+        ):
+            seq_summary = self._masked_mean(seq_tokens, seq_mask)
+            is_pair = torch.cat([
+                item_summary,
+                seq_summary,
+                item_summary * seq_summary,
+                torch.abs(item_summary - seq_summary),
+            ], dim=-1)
+            pair_tokens.append(F.silu(proj(is_pair)).unsqueeze(1))
+
+        return pair_tokens
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
-        context_time_bias = None
-        if self.use_context_time_features and self.context_time_dim > 0:
-            context_time_bias = F.silu(self.context_time_proj(inputs.context_time_feats))
 
         ns_parts = [user_ns]
         if self.has_user_dense:
@@ -1672,10 +1739,11 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
-        if context_time_bias is not None:
-            ns_tokens = ns_tokens + context_time_bias.unsqueeze(1)
+        if self.has_engineered_dense:
+            engineered_tok = F.silu(
+                self.engineered_dense_proj(inputs.engineered_dense_feats)
+            ).unsqueeze(1)
+            ns_parts.append(engineered_tok)
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1690,6 +1758,14 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
+        pair_tokens = self._build_pair_tokens(
+            user_ns=user_ns,
+            item_ns=item_ns,
+            seq_tokens_list=seq_tokens_list,
+            seq_masks_list=seq_masks_list,
+        )
+        ns_tokens = torch.cat(ns_parts + pair_tokens, dim=1)  # (B, num_ns, D)
+
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
@@ -1698,8 +1774,6 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training
         )
-        if context_time_bias is not None:
-            output = output + context_time_bias
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1710,9 +1784,6 @@ class PCVRHyFormer(nn.Module):
         # Reuses forward logic but without dropout
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
-        context_time_bias = None
-        if self.use_context_time_features and self.context_time_dim > 0:
-            context_time_bias = F.silu(self.context_time_proj(inputs.context_time_feats))
 
         ns_parts = [user_ns]
         if self.has_user_dense:
@@ -1722,10 +1793,11 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)
-        if context_time_bias is not None:
-            ns_tokens = ns_tokens + context_time_bias.unsqueeze(1)
+        if self.has_engineered_dense:
+            engineered_tok = F.silu(
+                self.engineered_dense_proj(inputs.engineered_dense_feats)
+            ).unsqueeze(1)
+            ns_parts.append(engineered_tok)
 
         seq_tokens_list = []
         seq_masks_list = []
@@ -1739,14 +1811,20 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
+        pair_tokens = self._build_pair_tokens(
+            user_ns=user_ns,
+            item_ns=item_ns,
+            seq_tokens_list=seq_tokens_list,
+            seq_masks_list=seq_masks_list,
+        )
+        ns_tokens = torch.cat(ns_parts + pair_tokens, dim=1)
+
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
-        if context_time_bias is not None:
-            output = output + context_time_bias
 
         logits = self.clsfier(output)
         return logits, output
