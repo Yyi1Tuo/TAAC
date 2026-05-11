@@ -65,7 +65,7 @@ _FALLBACK_MODEL_CFG = {
     'rope_base': 10000.0,
     'emb_skip_threshold': 0,
     'seq_id_threshold': 10000,
-    'use_pair_tokens': True,
+    'user_dense_dropoutp': 0.1,
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
@@ -178,7 +178,7 @@ def build_model(
         device: torch device.
     """
     # NS grouping. The JSON schema uses *fid* (feature id) values; convert
-    # them to positional indices into ``user_int_schema.entries`` /
+    # them to positional indices into user int + split dense entries /
     # ``item_int_schema.entries`` so ``GroupNSTokenizer`` /
     # ``RankMixerNSTokenizer`` can index ``feature_specs`` directly. This is
     # the same conversion ``train.py`` performs when loading the JSON; doing
@@ -192,14 +192,23 @@ def build_model(
         user_fid_to_idx = {
             fid: i for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)
         }
+        user_dense_offset = len(user_fid_to_idx)
+        user_fid_to_idx.update({
+            fid: user_dense_offset + i
+            for i, (fid, _, _) in enumerate(dataset.user_dense_as_int_schema.entries)
+        })
         item_fid_to_idx = {
             fid: i for i, (fid, _, _) in enumerate(dataset.item_int_schema.entries)
         }
         try:
-            user_ns_groups = [
-                [user_fid_to_idx[f] for f in fids]
-                for fids in ns_groups_cfg['user_ns_groups'].values()
-            ]
+            configured_user_fids = set()
+            user_ns_groups = []
+            for fids in ns_groups_cfg['user_ns_groups'].values():
+                configured_user_fids.update(fids)
+                user_ns_groups.append([user_fid_to_idx[f] for f in fids])
+            for fid, _, _ in dataset.user_dense_as_int_schema.entries:
+                if fid not in configured_user_fids:
+                    user_ns_groups.append([user_fid_to_idx[fid]])
             item_ns_groups = [
                 [item_fid_to_idx[f] for f in fids]
                 for fids in ns_groups_cfg['item_ns_groups'].values()
@@ -212,7 +221,10 @@ def build_model(
             ) from exc
     else:
         logging.info("No NS groups JSON found, using default: each feature as one group")
-        user_ns_groups = [[i] for i in range(len(dataset.user_int_schema.entries))]
+        user_ns_groups = [[i] for i in range(
+            len(dataset.user_int_schema.entries)
+            + len(dataset.user_dense_as_int_schema.entries)
+        )]
         item_ns_groups = [[i] for i in range(len(dataset.item_int_schema.entries))]
 
     # Feature specs.
@@ -224,10 +236,13 @@ def build_model(
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
         user_int_feature_specs=user_int_feature_specs,
+        user_dense_as_int_feature_specs=[
+            (offset, length)
+            for _, offset, length in dataset.user_dense_as_int_schema.entries
+        ],
         item_int_feature_specs=item_int_feature_specs,
         user_dense_dim=dataset.user_dense_schema.total_dim,
         item_dense_dim=dataset.item_dense_schema.total_dim,
-        engineered_dense_dim=dataset.engineered_dense_dim,
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
@@ -286,6 +301,7 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_time_features: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -293,16 +309,20 @@ def _batch_to_model_input(
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_time_features[domain] = device_batch.get(
+            f'{domain}_time_features',
+            torch.zeros(B, L, 6, dtype=torch.float32, device=device))
 
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
         item_int_feats=device_batch['item_int_feats'],
+        user_dense_as_int_feats=device_batch['user_dense_as_int_feats'],
         user_dense_feats=device_batch['user_dense_feats'],
-        engineered_dense_feats=device_batch['engineered_dense_feats'],
         item_dense_feats=device_batch['item_dense_feats'],
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_time_features=seq_time_features,
     )
 
 

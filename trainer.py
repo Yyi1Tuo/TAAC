@@ -58,11 +58,6 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
-        # ----- Speed knobs (all default to OFF for full backward compat) -----
-        use_amp: bool = False,
-        amp_dtype: str = 'bfloat16',
-        grad_clip_foreach: bool = False,
-        tqdm_min_interval: float = 0.0,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -113,39 +108,9 @@ class PCVRHyFormerRankingTrainer:
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
 
-        # ----- Speed configuration -----
-        self.tqdm_min_interval: float = tqdm_min_interval
-        self.grad_clip_foreach: bool = grad_clip_foreach
-        # Resolve AMP setup once so the hot path stays branch-light.
-        self.use_amp: bool = bool(use_amp) and str(device).startswith('cuda') \
-            and torch.cuda.is_available()
-        self._amp_dtype: torch.dtype = torch.bfloat16
-        self._amp_scaler: Optional[torch.cuda.amp.GradScaler] = None
-        if self.use_amp:
-            requested = (amp_dtype or 'bfloat16').lower()
-            bf16_ok = (
-                requested == 'bfloat16'
-                and hasattr(torch.cuda, 'is_bf16_supported')
-                and torch.cuda.is_bf16_supported()
-            )
-            if bf16_ok:
-                self._amp_dtype = torch.bfloat16
-            else:
-                # bf16 not supported (or fp16 explicitly requested) -> use fp16
-                # which requires a GradScaler to keep gradients in range.
-                self._amp_dtype = torch.float16
-                self._amp_scaler = torch.cuda.amp.GradScaler()
-            logging.info(
-                f"AMP enabled: dtype={self._amp_dtype}, "
-                f"grad_scaler={'on' if self._amp_scaler is not None else 'off'}"
-            )
-
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
-                     f"use_amp={self.use_amp}, "
-                     f"grad_clip_foreach={self.grad_clip_foreach}, "
-                     f"tqdm_min_interval={self.tqdm_min_interval}")
+                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -330,19 +295,9 @@ class PCVRHyFormerRankingTrainer:
         self.model.train()
         total_step = 0
 
-        # tqdm refresh throttling: when tqdm_min_interval > 0, set_postfix
-        # below batches updates so we don't pay terminal-write overhead on
-        # every step. Tracks the next step index allowed to refresh.
-        postfix_stride = max(1, int(self.tqdm_min_interval * 50)) \
-            if self.tqdm_min_interval > 0 else 1
-
         for epoch in range(1, self.num_epochs + 1):
-            train_pbar = tqdm(
-                enumerate(self.train_loader),
-                total=len(self.train_loader),
-                dynamic_ncols=True,
-                mininterval=max(0.1, self.tqdm_min_interval),
-            )
+            train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
+                              dynamic_ncols=True)
             loss_sum = 0.0
 
             for step, batch in train_pbar:
@@ -353,8 +308,7 @@ class PCVRHyFormerRankingTrainer:
                 if self.writer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
 
-                if total_step % postfix_stride == 0:
-                    train_pbar.set_postfix({"loss": f"{loss:.4f}"})
+                train_pbar.set_postfix({"loss": f"{loss:.4f}"})
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
@@ -427,6 +381,7 @@ class PCVRHyFormerRankingTrainer:
         seq_data: Dict[str, torch.Tensor] = {}
         seq_lens: Dict[str, torch.Tensor] = {}
         seq_time_buckets: Dict[str, torch.Tensor] = {}
+        seq_time_features: Dict[str, torch.Tensor] = {}
         for domain in seq_domains:
             seq_data[domain] = device_batch[domain]
             seq_lens[domain] = device_batch[f'{domain}_len']
@@ -435,15 +390,19 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets[domain] = device_batch.get(
                 f'{domain}_time_bucket',
                 torch.zeros(B, L, dtype=torch.long, device=self.device))
+            seq_time_features[domain] = device_batch.get(
+                f'{domain}_time_features',
+                torch.zeros(B, L, 6, dtype=torch.float32, device=self.device))
         return ModelInput(
             user_int_feats=device_batch['user_int_feats'],
             item_int_feats=device_batch['item_int_feats'],
+            user_dense_as_int_feats=device_batch['user_dense_as_int_feats'],
             user_dense_feats=device_batch['user_dense_feats'],
-            engineered_dense_feats=device_batch['engineered_dense_feats'],
             item_dense_feats=device_batch['item_dense_feats'],
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
+            seq_time_features=seq_time_features,
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:
@@ -451,58 +410,24 @@ class PCVRHyFormerRankingTrainer:
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
-        self.dense_optimizer.zero_grad(set_to_none=True)
+        self.dense_optimizer.zero_grad()
         if self.sparse_optimizer is not None:
-            self.sparse_optimizer.zero_grad(set_to_none=True)
+            self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
+        logits = self.model(model_input)  # (B, 1)
+        logits = logits.squeeze(-1)  # (B,)
 
-        # AMP-aware forward + loss. With bfloat16 we skip GradScaler entirely;
-        # with fp16 we keep one. Embedding lookups are not run under autocast
-        # by PyTorch (they always return float32) so optimizer state for
-        # Adagrad-managed sparse params is unaffected.
-        if self.use_amp:
-            with torch.cuda.amp.autocast(dtype=self._amp_dtype):
-                logits = self.model(model_input).squeeze(-1)
-                if self.loss_type == 'focal':
-                    loss = sigmoid_focal_loss(
-                        logits, label,
-                        alpha=self.focal_alpha, gamma=self.focal_gamma,
-                    )
-                else:
-                    loss = F.binary_cross_entropy_with_logits(logits, label)
+        if self.loss_type == 'focal':
+            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
         else:
-            logits = self.model(model_input).squeeze(-1)
-            if self.loss_type == 'focal':
-                loss = sigmoid_focal_loss(
-                    logits, label,
-                    alpha=self.focal_alpha, gamma=self.focal_gamma,
-                )
-            else:
-                loss = F.binary_cross_entropy_with_logits(logits, label)
+            loss = F.binary_cross_entropy_with_logits(logits, label)
+        loss.backward()
+        # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
+        # with certain tensor shapes in this project.
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
 
-        if self._amp_scaler is not None:
-            self._amp_scaler.scale(loss).backward()
-            # Unscale dense optimizer's grads before clipping; sparse Adagrad
-            # is not scaled because Embedding grads remain float32.
-            self._amp_scaler.unscale_(self.dense_optimizer)
-        else:
-            loss.backward()
-
-        # foreach=False (default) avoids a PyTorch _foreach_norm CUDA kernel
-        # bug previously observed with certain tensor shapes; the fast path
-        # can be re-enabled via --grad_clip_foreach when known to be safe.
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(),
-            max_norm=1.0,
-            foreach=self.grad_clip_foreach,
-        )
-
-        if self._amp_scaler is not None:
-            self._amp_scaler.step(self.dense_optimizer)
-            self._amp_scaler.update()
-        else:
-            self.dense_optimizer.step()
+        self.dense_optimizer.step()
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
 

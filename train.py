@@ -78,16 +78,6 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of training Row Groups to use (takes the first N%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
-    parser.add_argument('--time_aware_split', action='store_true', default=True,
-                        help='Sort Row Groups by their min timestamp before '
-                             'splitting train/valid; train takes the earliest '
-                             'part and valid takes the most recent tail. '
-                             'Eliminates temporal leakage caused by '
-                             'filename-lexicographic ordering. Default on.')
-    parser.add_argument('--no_time_aware_split', dest='time_aware_split',
-                        action='store_false',
-                        help='Disable time-aware splitting and fall back to '
-                             'filename-lexicographic Row Group order.')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -154,28 +144,6 @@ def parse_args() -> argparse.Namespace:
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
 
-    # ---- Speed knobs (no impact on AUC besides AMP, which is near-lossless) ----
-    parser.add_argument('--use_amp', action='store_true', default=False,
-                        help='Enable mixed-precision training (autocast). '
-                             'Auto-uses bfloat16 when supported (no GradScaler), '
-                             'else falls back to float16 with GradScaler. '
-                             'Has no effect on CPU or when CUDA is unavailable.')
-    parser.add_argument('--amp_dtype', type=str, default='bfloat16',
-                        choices=['bfloat16', 'float16'],
-                        help='Preferred AMP dtype when --use_amp is set.')
-    parser.add_argument('--use_tf32', action='store_true', default=False,
-                        help='Enable TF32 matmul on Ampere+ GPUs '
-                             '(torch.set_float32_matmul_precision=high).')
-    parser.add_argument('--grad_clip_foreach', action='store_true', default=False,
-                        help='Use the foreach implementation of clip_grad_norm_ '
-                             '(faster but historically tripped a CUDA kernel '
-                             'bug for some shapes; default off for safety).')
-    parser.add_argument('--tqdm_min_interval', type=float, default=0.0,
-                        help='Minimum tqdm refresh interval in seconds; '
-                             '>0 throttles per-step terminal writes (default 0=off).')
-    parser.add_argument('--prefetch_factor', type=int, default=4,
-                        help='DataLoader prefetch_factor when num_workers>0.')
-
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
                         help='Learning rate for sparse parameters (Adagrad over Embeddings)')
@@ -205,10 +173,8 @@ def parse_args() -> argparse.Namespace:
                              'extra dropout(rate*2) during training to reduce overfitting. '
                              'Features at or below this threshold are treated as side-info '
                              'and receive no extra dropout.')
-    parser.add_argument('--use_pair_tokens', action='store_true', default=True,
-                        help='Enable explicit user-item and item-sequence pair tokens (default on).')
-    parser.add_argument('--no_pair_tokens', dest='use_pair_tokens', action='store_false',
-                        help='Disable explicit pair tokens.')
+    parser.add_argument('--user_dense_dropoutp', type=float, default=0.1,
+                        help='Dropout probability applied to the projected user_dense token.')
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -285,32 +251,39 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
-        prefetch_factor=args.prefetch_factor,
-        time_aware_split=args.time_aware_split,
     )
-
-    # Enable TF32 matmul (Ampere+) for a free dense-matmul speedup. Only
-    # affects float32 ops; AMP / bfloat16 paths are independent.
-    if args.use_tf32:
-        torch.set_float32_matmul_precision('high')
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        logging.info("TF32 matmul enabled (high precision mode)")
 
     # ---- NS groups ----
     if args.ns_groups_json and os.path.exists(args.ns_groups_json):
         logging.info(f"Loading NS groups from {args.ns_groups_json}")
         with open(args.ns_groups_json, 'r') as f:
             ns_groups_cfg = json.load(f)
-        user_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.user_int_schema.entries)}
+        user_fid_to_idx = {
+            fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.user_int_schema.entries)
+        }
+        user_dense_offset = len(user_fid_to_idx)
+        user_fid_to_idx.update({
+            fid: user_dense_offset + i
+            for i, (fid, _, _) in enumerate(pcvr_dataset.user_dense_as_int_schema.entries)
+        })
         item_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)}
-        user_ns_groups = [[user_fid_to_idx[f] for f in fids] for fids in ns_groups_cfg['user_ns_groups'].values()]
+        configured_user_fids = set()
+        user_ns_groups = []
+        for fids in ns_groups_cfg['user_ns_groups'].values():
+            configured_user_fids.update(fids)
+            user_ns_groups.append([user_fid_to_idx[f] for f in fids])
+        for fid, _, _ in pcvr_dataset.user_dense_as_int_schema.entries:
+            if fid not in configured_user_fids:
+                user_ns_groups.append([user_fid_to_idx[fid]])
         item_ns_groups = [[item_fid_to_idx[f] for f in fids] for fids in ns_groups_cfg['item_ns_groups'].values()]
         logging.info(f"User NS groups ({len(user_ns_groups)}): {list(ns_groups_cfg['user_ns_groups'].keys())}")
         logging.info(f"Item NS groups ({len(item_ns_groups)}): {list(ns_groups_cfg['item_ns_groups'].keys())}")
     else:
         logging.info("No NS groups JSON found, using default: each feature as one group")
-        user_ns_groups = [[i] for i in range(len(pcvr_dataset.user_int_schema.entries))]
+        user_ns_groups = [[i] for i in range(
+            len(pcvr_dataset.user_int_schema.entries)
+            + len(pcvr_dataset.user_dense_as_int_schema.entries)
+        )]
         item_ns_groups = [[i] for i in range(len(pcvr_dataset.item_int_schema.entries))]
 
     # ---- Build model ----
@@ -321,10 +294,13 @@ def main() -> None:
 
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
+        "user_dense_as_int_feature_specs": [
+            (offset, length)
+            for _, offset, length in pcvr_dataset.user_dense_as_int_schema.entries
+        ],
         "item_int_feature_specs": item_int_feature_specs,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
-        "engineered_dense_dim": pcvr_dataset.engineered_dense_dim,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
@@ -345,7 +321,7 @@ def main() -> None:
         "rope_base": args.rope_base,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
-        "use_pair_tokens": args.use_pair_tokens,
+        "user_dense_dropoutp": args.user_dense_dropoutp,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
@@ -398,10 +374,6 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
-        use_amp=args.use_amp,
-        amp_dtype=args.amp_dtype,
-        grad_clip_foreach=args.grad_clip_foreach,
-        tqdm_min_interval=args.tqdm_min_interval,
     )
 
     trainer.train()
