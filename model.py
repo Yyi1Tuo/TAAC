@@ -1280,8 +1280,11 @@ class PCVRHyFormer(nn.Module):
         self,
         # Data schema
         user_int_feature_specs: List[Tuple[int, int, int]],
+        user_int_feature_ids: Optional[List[int]],
         user_dense_as_int_feature_specs: Optional[List[Tuple[int, int]]],
         item_int_feature_specs: List[Tuple[int, int, int]],
+        user_dense_feature_ids: Optional[List[int]],
+        user_dense_feature_specs: Optional[List[Tuple[int, int]]],
         user_dense_dim: int,
         item_dense_dim: int,
         seq_vocab_sizes: "dict[str, List[int]]",  # {domain: [vocab_size_per_fid, ...]}
@@ -1307,6 +1310,10 @@ class PCVRHyFormer(nn.Module):
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
         user_dense_dropoutp: float = 0.1,
+        enable_dense_int_interaction: bool = False,
+        interaction_hidden_dim: int = 64,
+        interaction_dropout: float = 0.1,
+        interaction_fids: Optional[List[int]] = None,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1328,6 +1335,19 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.user_int_feature_ids = user_int_feature_ids or []
+        self.user_dense_feature_ids = user_dense_feature_ids or []
+        self.user_dense_feature_specs = user_dense_feature_specs or []
+        self._user_int_fid_to_idx = {
+            fid: idx for idx, fid in enumerate(self.user_int_feature_ids)
+        }
+        self._user_dense_fid_to_spec = {
+            fid: spec for fid, spec in zip(self.user_dense_feature_ids, self.user_dense_feature_specs)
+        }
+        self.enable_dense_int_interaction = enable_dense_int_interaction
+        self.interaction_fids = interaction_fids or [62, 63, 64, 65, 66]
+        self.user_dense_interaction_dropout = nn.Dropout(interaction_dropout)
+        self.has_dense_int_interaction = False
 
         # ================== NS Tokens Construction ==================
 
@@ -1391,6 +1411,12 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(user_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+            if self.enable_dense_int_interaction:
+                self._init_dense_int_interaction(
+                    d_model=d_model,
+                    emb_dim=emb_dim,
+                    hidden_dim=interaction_hidden_dim,
+                )
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
@@ -1633,6 +1659,71 @@ class PCVRHyFormer(nn.Module):
         sparse_ptrs = {p.data_ptr() for p in self.get_sparse_params()}
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
 
+    def _init_dense_int_interaction(
+        self,
+        d_model: int,
+        emb_dim: int,
+        hidden_dim: int,
+    ) -> None:
+        """Initialize the explicit user dense/int interaction branch."""
+        valid_fids = [
+            fid for fid in self.interaction_fids
+            if fid in self._user_int_fid_to_idx and fid in self._user_dense_fid_to_spec
+        ]
+        self.interaction_fids = valid_fids
+        self.has_dense_int_interaction = len(valid_fids) > 0
+        self.user_interaction_dense_projs = nn.ModuleDict()
+        self.user_interaction_pair_projs = nn.ModuleDict()
+        if not self.has_dense_int_interaction:
+            logging.warning(
+                "Dense/int interaction was enabled, but none of the requested fids "
+                "exist in both user_int and user_dense paths. The branch will be disabled."
+            )
+            return
+
+        for fid in valid_fids:
+            _, dense_len = self._user_dense_fid_to_spec[fid]
+            self.user_interaction_dense_projs[str(fid)] = nn.Sequential(
+                nn.Linear(dense_len, emb_dim),
+                nn.LayerNorm(emb_dim),
+            )
+            self.user_interaction_pair_projs[str(fid)] = nn.Sequential(
+                nn.Linear(4 * emb_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+        logging.info(f"Dense/int interaction enabled for user fids={valid_fids}")
+
+    def _build_dense_int_interaction_token(
+        self,
+        user_int_feats: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Build one token from paired user dense/int features."""
+        if not self.has_dense_int_interaction:
+            return None
+
+        pair_tokens = []
+        for fid in self.interaction_fids:
+            fid_idx = self._user_int_fid_to_idx[fid]
+            int_emb = self.user_ns_tokenizer._embed_feature(fid_idx, user_int_feats, None)
+            dense_offset, dense_len = self._user_dense_fid_to_spec[fid]
+            dense_slice = user_dense_feats[:, dense_offset:dense_offset + dense_len].float()
+            dense_emb = F.silu(self.user_interaction_dense_projs[str(fid)](dense_slice))
+            pair_feat = torch.cat([
+                int_emb,
+                dense_emb,
+                int_emb * dense_emb,
+                torch.abs(int_emb - dense_emb),
+            ], dim=-1)
+            pair_tok = F.silu(self.user_interaction_pair_projs[str(fid)](pair_feat))
+            pair_tokens.append(pair_tok)
+
+        if not pair_tokens:
+            return None
+        return torch.stack(pair_tokens, dim=1).mean(dim=1)
+
     def _embed_seq_domain(
         self,
         seq: torch.Tensor,
@@ -1773,6 +1864,12 @@ class PCVRHyFormer(nn.Module):
         ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats))
+            interaction_tok = self._build_dense_int_interaction_token(
+                inputs.user_int_feats,
+                inputs.user_dense_feats,
+            )
+            if interaction_tok is not None:
+                user_dense_tok = user_dense_tok + self.user_dense_interaction_dropout(interaction_tok)
             user_dense_tok = self.user_dense_dropout(user_dense_tok).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
@@ -1822,6 +1919,12 @@ class PCVRHyFormer(nn.Module):
         ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats))
+            interaction_tok = self._build_dense_int_interaction_token(
+                inputs.user_int_feats,
+                inputs.user_dense_feats,
+            )
+            if interaction_tok is not None:
+                user_dense_tok = user_dense_tok + self.user_dense_interaction_dropout(interaction_tok)
             user_dense_tok = self.user_dense_dropout(user_dense_tok).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)

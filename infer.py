@@ -66,6 +66,10 @@ _FALLBACK_MODEL_CFG = {
     'emb_skip_threshold': 0,
     'seq_id_threshold': 10000,
     'user_dense_dropoutp': 0.1,
+    'enable_dense_int_interaction': False,
+    'interaction_hidden_dim': 64,
+    'interaction_dropout': 0.1,
+    'interaction_fids': [62, 63, 64, 65, 66],
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
@@ -236,11 +240,17 @@ def build_model(
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
         user_int_feature_specs=user_int_feature_specs,
+        user_int_feature_ids=[fid for fid, _, _ in dataset.user_int_schema.entries],
         user_dense_as_int_feature_specs=[
             (offset, length)
             for _, offset, length in dataset.user_dense_as_int_schema.entries
         ],
         item_int_feature_specs=item_int_feature_specs,
+        user_dense_feature_ids=[fid for fid, _, _ in dataset.user_dense_schema.entries],
+        user_dense_feature_specs=[
+            (offset, length)
+            for _, offset, length in dataset.user_dense_schema.entries
+        ],
         user_dense_dim=dataset.user_dense_schema.total_dim,
         item_dense_dim=dataset.item_dense_schema.total_dim,
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,

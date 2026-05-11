@@ -175,6 +175,14 @@ def parse_args() -> argparse.Namespace:
                              'and receive no extra dropout.')
     parser.add_argument('--user_dense_dropoutp', type=float, default=0.1,
                         help='Dropout probability applied to the projected user_dense token.')
+    parser.add_argument('--enable_dense_int_interaction', action='store_true', default=False,
+                        help='Enable explicit dense/int interaction injection for user fids 62-66.')
+    parser.add_argument('--interaction_hidden_dim', type=int, default=64,
+                        help='Hidden dimension used by the dense/int interaction branch.')
+    parser.add_argument('--interaction_dropout', type=float, default=0.1,
+                        help='Dropout applied to the dense/int interaction token before merging.')
+    parser.add_argument('--interaction_fids', type=str, default='62,63,64,65,66',
+                        help='Comma-separated user feature ids used by the dense/int interaction branch.')
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -294,11 +302,17 @@ def main() -> None:
 
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
+        "user_int_feature_ids": [fid for fid, _, _ in pcvr_dataset.user_int_schema.entries],
         "user_dense_as_int_feature_specs": [
             (offset, length)
             for _, offset, length in pcvr_dataset.user_dense_as_int_schema.entries
         ],
         "item_int_feature_specs": item_int_feature_specs,
+        "user_dense_feature_ids": [fid for fid, _, _ in pcvr_dataset.user_dense_schema.entries],
+        "user_dense_feature_specs": [
+            (offset, length)
+            for _, offset, length in pcvr_dataset.user_dense_schema.entries
+        ],
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
@@ -322,6 +336,10 @@ def main() -> None:
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
         "user_dense_dropoutp": args.user_dense_dropoutp,
+        "enable_dense_int_interaction": args.enable_dense_int_interaction,
+        "interaction_hidden_dim": args.interaction_hidden_dim,
+        "interaction_dropout": args.interaction_dropout,
+        "interaction_fids": [int(fid.strip()) for fid in args.interaction_fids.split(',') if fid.strip()],
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,

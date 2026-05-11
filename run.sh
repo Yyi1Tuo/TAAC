@@ -13,6 +13,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
+    --enable_dense_int_interaction \
+    --interaction_hidden_dim 64 \
+    --interaction_dropout 0.1 \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
@@ -30,3 +33,17 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --emb_skip_threshold 1000000 \
 #     --num_workers 8 \
 #     "$@"
+#
+# ---- Experiment variants for platform upload ----
+# Baseline:
+#   bash run.sh
+#
+# E1 main interaction branch:
+#   bash run.sh --enable_dense_int_interaction \
+#       --interaction_hidden_dim 64 \
+#       --interaction_dropout 0.1
+#
+# E2 stronger interaction branch:
+#   bash run.sh --enable_dense_int_interaction \
+#       --interaction_hidden_dim 128 \
+#       --interaction_dropout 0.05

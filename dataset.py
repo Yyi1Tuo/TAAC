@@ -26,6 +26,7 @@ from torch.utils.data import IterableDataset, DataLoader
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 USER_DENSE_AS_INT_FIDS = {61}
+INTERACTION_DENSE_FIDS = {62, 63, 64, 65, 66}
 
 # numpy.typing is available since numpy >= 1.20; on older numpy fall back to a
 # no-op shim so that forward-referenced annotations like ``npt.NDArray[np.int64]``
