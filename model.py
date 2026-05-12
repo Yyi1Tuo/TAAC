@@ -1476,7 +1476,8 @@ class PCVRHyFormer(nn.Module):
 
         Args:
             cardinality_threshold: Only embeddings with vocab_size exceeding
-                this value are reinitialized.
+                this value are reinitialized. A value of 0 reinitializes every
+                embedding with vocab_size > 0.
 
         Returns:
             A set of data_ptr() values for reinitialized parameters.

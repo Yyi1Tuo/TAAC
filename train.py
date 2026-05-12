@@ -67,6 +67,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
+    parser.add_argument('--amp', action='store_true', default=False,
+                        help='Enable CUDA automatic mixed precision for model forward')
+    parser.add_argument('--no_amp', dest='amp', action='store_false',
+                        help='Disable automatic mixed precision')
+    parser.add_argument('--amp_dtype', type=str, default='bf16',
+                        choices=['bf16', 'fp16'],
+                        help='AMP compute dtype. bf16 is preferred when supported.')
+    parser.add_argument('--compile', action='store_true', default=False,
+                        help='Enable torch.compile for the model forward')
+    parser.add_argument('--no_compile', dest='compile', action='store_false',
+                        help='Disable torch.compile')
+    parser.add_argument('--compile_mode', type=str, default='default',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode')
 
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
@@ -158,7 +172,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--reinit_cardinality_threshold', type=int, default=0,
                         help='Cardinality threshold used by the re-init strategy: '
                              'Embeddings whose vocab_size exceeds this value are reset '
-                             'at each epoch end (0 = never reset any Embedding)')
+                             'at each epoch end (0 = reset all Embeddings with vocab_size > 0)')
 
     # Embedding construction control.
     parser.add_argument('--emb_skip_threshold', type=int, default=0,
@@ -350,6 +364,10 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        use_amp=args.amp,
+        amp_dtype=args.amp_dtype,
+        compile_model=args.compile,
+        compile_mode=args.compile_mode,
     )
 
     trainer.train()

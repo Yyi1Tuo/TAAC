@@ -58,8 +58,13 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        use_amp: bool = False,
+        amp_dtype: str = 'bf16',
+        compile_model: bool = False,
+        compile_mode: str = 'default',
     ) -> None:
         self.model: nn.Module = model
+        self.forward_model: nn.Module = model
         self.train_loader: DataLoader = train_loader
         self.valid_loader: DataLoader = valid_loader
         self.writer = writer
@@ -107,10 +112,33 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.device_type: str = torch.device(device).type
+        self.use_amp: bool = use_amp
+        if self.use_amp and self.device_type != 'cuda':
+            raise ValueError("--amp requires a CUDA device")
+        if amp_dtype == 'bf16':
+            self.amp_dtype = torch.bfloat16
+            if self.use_amp and not torch.cuda.is_bf16_supported():
+                raise ValueError("bf16 AMP requested, but this CUDA device does not support bf16")
+        elif amp_dtype == 'fp16':
+            self.amp_dtype = torch.float16
+        else:
+            raise ValueError(f"Unsupported amp_dtype: {amp_dtype}")
+        self.grad_scaler = torch.amp.GradScaler(
+            self.device_type,
+            enabled=self.use_amp and self.amp_dtype == torch.float16,
+        )
+        if compile_model:
+            if not hasattr(torch, 'compile'):
+                raise RuntimeError("torch.compile is unavailable in this PyTorch build")
+            logging.info(f"Compiling model forward with torch.compile(mode={compile_mode})")
+            self.forward_model = torch.compile(model, mode=compile_mode)
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+        logging.info(f"Runtime acceleration: amp={self.use_amp}, "
+                     f"amp_dtype={amp_dtype}, compile={compile_model}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -352,7 +380,8 @@ class PCVRHyFormerRankingTrainer:
             # Reference: KuaiShou Tech., "MultiEpoch: Reusing Training Data
             # for Click-Through Rate Prediction",
             # https://arxiv.org/pdf/2305.19531
-            if epoch >= self.reinit_sparse_after_epoch and self.sparse_optimizer is not None:
+            if (epoch >= self.reinit_sparse_after_epoch
+                    and self.sparse_optimizer is not None):
                 # Snapshot Adagrad state per parameter via data_ptr, so state
                 # of low-cardinality embeddings can be preserved across rebuild.
                 old_state: Dict[int, Any] = {}
@@ -404,26 +433,45 @@ class PCVRHyFormerRankingTrainer:
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
-        self.dense_optimizer.zero_grad()
+        self.dense_optimizer.zero_grad(set_to_none=True)
         if self.sparse_optimizer is not None:
-            self.sparse_optimizer.zero_grad()
+            self.sparse_optimizer.zero_grad(set_to_none=True)
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        with torch.amp.autocast(
+            device_type=self.device_type,
+            dtype=self.amp_dtype,
+            enabled=self.use_amp,
+        ):
+            logits = self.forward_model(model_input)  # (B, 1)
+        logits = logits.squeeze(-1).float()  # (B,)
 
         if self.loss_type == 'focal':
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
-        loss.backward()
+
+        if self.grad_scaler.is_enabled():
+            self.grad_scaler.scale(loss).backward()
+            self.grad_scaler.unscale_(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.grad_scaler.unscale_(self.sparse_optimizer)
+        else:
+            loss.backward()
+
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
 
-        self.dense_optimizer.step()
-        if self.sparse_optimizer is not None:
-            self.sparse_optimizer.step()
+        if self.grad_scaler.is_enabled():
+            self.grad_scaler.step(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.grad_scaler.step(self.sparse_optimizer)
+            self.grad_scaler.update()
+        else:
+            self.dense_optimizer.step()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.step()
 
         return loss.item()
 
@@ -443,7 +491,7 @@ class PCVRHyFormerRankingTrainer:
         all_logits_list = []
         all_labels_list = []
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for step, batch in pbar:
                 logits, labels = self._evaluate_step(batch)
                 all_logits_list.append(logits.detach().cpu())
@@ -488,7 +536,12 @@ class PCVRHyFormerRankingTrainer:
         label = device_batch['label']
 
         model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
-        logits = logits.squeeze(-1)  # (B,)
+        with torch.amp.autocast(
+            device_type=self.device_type,
+            dtype=self.amp_dtype,
+            enabled=self.use_amp,
+        ):
+            logits = self.forward_model(model_input)  # (B, 1)
+        logits = logits.squeeze(-1).float()  # (B,)
 
         return logits, label

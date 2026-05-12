@@ -10,6 +10,10 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_queries 2 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
+    --amp \
+    --amp_dtype bf16 \
+    --compile \
+    --compile_mode default \
     --num_workers 8 \
     "$@"
 
@@ -24,5 +28,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
 #     --num_queries 1 \
 #     --emb_skip_threshold 1000000 \
+#     --amp \
+#     --amp_dtype bf16 \
+#     --compile \
+#     --compile_mode default \
 #     --num_workers 8 \
 #     "$@"
