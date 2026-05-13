@@ -243,3 +243,23 @@ batch 中新增：
 - HuggingFace sample 小模型 1 epoch 训练、验证、保存 checkpoint 跑通
 - 新 checkpoint 通过 `infer.py` strict load，并生成 `predictions.json`
 - 旧 checkpoint 缺少时间特征配置时，`infer.py` fallback 到 0 维并 strict load 成功
+
+## 8. SENet v2：RankMixer block token-wise SENet
+
+`v2` 分支只在 HyFormer block 内部的 `RankMixerBlock` 输入处加入 token-wise SENet。
+作用点固定在 token mixing 之前：
+
+```text
+combined query/NS tokens -> [B, T, d_model]
+TokenSENet               -> [B, T, d_model]
+token_mixing/FFN         -> [B, T, d_model]
+```
+
+新增参数：
+
+```bash
+--use_block_senet / --no_block_senet
+--senet_reduction 4
+```
+
+旧 checkpoint 缺少 `use_block_senet` 时，`infer.py` fallback 为关闭，以保证 strict load 兼容。

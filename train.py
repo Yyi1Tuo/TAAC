@@ -81,6 +81,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--compile_mode', type=str, default='default',
                         choices=['default', 'reduce-overhead', 'max-autotune'],
                         help='torch.compile mode')
+    parser.add_argument('--use_block_senet', action='store_true', default=True,
+                        help='Enable token-wise SENet before RankMixer token mixing')
+    parser.add_argument('--no_block_senet', dest='use_block_senet',
+                        action='store_false',
+                        help='Disable token-wise SENet before RankMixer token mixing')
+    parser.add_argument('--senet_reduction', type=int, default=4,
+                        help='SENet reduction ratio')
 
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
@@ -324,6 +331,8 @@ def main() -> None:
         "seq_id_threshold": args.seq_id_threshold,
         "context_time_dim": TIME_FEATURE_DIM if args.use_context_time_feats else 0,
         "seq_abs_time_dim": TIME_FEATURE_DIM if args.use_seq_abs_time_feats else 0,
+        "use_block_senet": args.use_block_senet,
+        "senet_reduction": args.senet_reduction,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
@@ -336,6 +345,9 @@ def main() -> None:
     num_ns = model.num_ns
     T = args.num_queries * num_sequences + num_ns
     logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
+    logging.info(f"SENet config: use_ns_senet=False, "
+                 f"use_block_senet={args.use_block_senet}, "
+                 f"senet_reduction={args.senet_reduction}")
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())
