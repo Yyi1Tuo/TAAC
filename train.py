@@ -19,7 +19,7 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS, TIME_FEATURE_DIM
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -137,6 +137,16 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
+    parser.add_argument('--use_context_time_feats', action='store_true', default=True,
+                        help='Enable sample-level absolute timestamp features')
+    parser.add_argument('--no_context_time_feats', dest='use_context_time_feats',
+                        action='store_false',
+                        help='Disable sample-level absolute timestamp features')
+    parser.add_argument('--use_seq_abs_time_feats', action='store_true', default=True,
+                        help='Enable per-event absolute timestamp features')
+    parser.add_argument('--no_seq_abs_time_feats', dest='use_seq_abs_time_feats',
+                        action='store_false',
+                        help='Disable per-event absolute timestamp features')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -312,6 +322,8 @@ def main() -> None:
         "rope_base": args.rope_base,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
+        "context_time_dim": TIME_FEATURE_DIM if args.use_context_time_feats else 0,
+        "seq_abs_time_dim": TIME_FEATURE_DIM if args.use_seq_abs_time_feats else 0,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,

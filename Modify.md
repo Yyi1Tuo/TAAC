@@ -142,3 +142,104 @@ NumPy、PyTorch CPU/CUDA RNG。
 
 - `datasets`
 - `tensorboard`
+
+## 6. 训练/推理提交文件同步说明
+
+比赛官方环境分训练和推理两阶段：
+
+- 训练阶段调用 `run.sh`，会用到 `train.py`、`trainer.py`、`dataset.py`、`model.py`、`utils.py`。
+- 推理阶段通常只包含 `dataset.py`、`infer.py`、`model.py`。
+
+当前改动的同步建议：
+
+- `model.py`：建议同步到推理阶段。推理加载 checkpoint 时，模型结构必须和训练阶段一致。
+  本次没有改模型结构，但为了避免训练/推理文件版本漂移，仍建议提交同一份 `model.py`。
+- `dataset.py`：建议同步到推理阶段。推理的数据解析、序列截断、time bucket 逻辑必须和训练一致。
+  本次新增的 seed 参数有默认值，对推理兼容；不会改变 `is_training=False` 的标签占位逻辑。
+- `infer.py`：已导入官方文件。当前推理阶段保持全精度，不启用 AMP。已将推理循环从
+  `torch.no_grad()` 改为 `torch.inference_mode()`，并修正 `num_workers=0` 时不能设置
+  `prefetch_factor` 的兼容性问题。没有默认启用 `torch.compile`，避免官方推理环境中出现额外
+  编译开销或兼容性风险。
+- `train.py`、`trainer.py`、`run.sh`、`utils.py`：推理阶段通常不需要同步，除非官方推理入口显式 import
+  了其中某个文件。
+
+特别注意：训练 checkpoint 旁边会保存 `train_config.json`，其中现在包含 `amp/compile/compile_mode`
+等训练加速参数。推理脚本如果读取 `train_config.json`，应该只取模型构造相关字段，或者显式忽略
+这些运行时加速字段，不能把整个 `train_config` 原样传给 `PCVRHyFormer(**kwargs)`。
+
+## 7. Time 分支：绝对时间特征增强
+
+本分支在保留原有 recency bucket 的基础上，增加样本级和序列事件级绝对时间特征。
+
+### 7.1 数据侧新增字段
+
+`dataset.py` 新增 `TIME_FEATURE_DIM=12` 和 `build_time_features(...)`。
+
+每个 Unix 秒级 timestamp 会被转换为 12 维 `float32` 特征：
+
+- daily sin/cos
+- weekly sin/cos
+- 30-day cycle sin/cos
+- yearly sin/cos
+- hour_norm
+- day_of_week_norm
+- is_weekend
+- timestamp_scaled
+
+说明：最初计划中写的是 11 维，但上面列出的完整特征实际是 12 维。实现中保留
+`timestamp_scaled` 这个绝对时间信号，因此最终使用 12 维。
+
+batch 中新增：
+
+- `context_time_feats`: `[B, 12]`，来自样本级 `timestamp`
+- `{domain}_abs_time_feats`: `[B, L, 12]`，来自每个序列域的事件 timestamp，padding 位置全 0
+
+### 7.2 模型侧接入方式
+
+`ModelInput` 新增：
+
+- `context_time_feats`
+- `seq_abs_time_feats`
+
+模型新增两个结构参数：
+
+- `context_time_dim`
+- `seq_abs_time_dim`
+
+接入方式：
+
+- `context_time_feats` 拼接到 `user_dense_feats` 后，继续走现有 user dense NS token，不新增 NS token。
+- 每个序列 domain 新增一个轻量 `Linear(seq_abs_time_dim, d_model, bias=False) + LayerNorm`，
+  将 `{domain}_abs_time_feats` 投影后加到对应 sequence token embedding。
+- 原有 `seq_time_buckets` 和 `time_embedding` 保持不变，用于表达行为距当前样本的 recency。
+
+### 7.3 训练与推理配置
+
+`train.py` 新增默认开启开关：
+
+```bash
+--use_context_time_feats / --no_context_time_feats
+--use_seq_abs_time_feats / --no_seq_abs_time_feats
+```
+
+训练保存的 `train_config.json` 会记录这两个开关。`infer.py` 会根据 `train_config.json`
+恢复：
+
+- `context_time_dim = TIME_FEATURE_DIM` 或 `0`
+- `seq_abs_time_dim = TIME_FEATURE_DIM` 或 `0`
+
+旧 checkpoint 若缺少这些字段，推理 fallback 为 `0` 维，以保证旧模型可以 strict load。
+推理阶段保持全精度，不启用 AMP。
+
+### 7.4 验证
+
+已完成：
+
+- `python -m py_compile TAAC/train.py TAAC/trainer.py TAAC/dataset.py TAAC/model.py TAAC/infer.py`
+- sample batch 形状检查：
+  - `context_time_feats == [B, 12]`
+  - 每个 `{domain}_abs_time_feats == [B, L, 12]`
+  - padding 位置绝对时间特征全 0
+- HuggingFace sample 小模型 1 epoch 训练、验证、保存 checkpoint 跑通
+- 新 checkpoint 通过 `infer.py` strict load，并生成 `predictions.json`
+- 旧 checkpoint 缺少时间特征配置时，`infer.py` fallback 到 0 维并 strict load 成功

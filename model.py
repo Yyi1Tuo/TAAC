@@ -13,9 +13,11 @@ class ModelInput(NamedTuple):
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
+    context_time_feats: torch.Tensor
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_abs_time_feats: dict  # {domain: tensor [B, L, T]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1225,6 +1227,8 @@ class PCVRHyFormer(nn.Module):
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
+        context_time_dim: int = 0,
+        seq_abs_time_dim: int = 0,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1244,6 +1248,8 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.context_time_dim = context_time_dim
+        self.seq_abs_time_dim = seq_abs_time_dim
 
         # ================== NS Tokens Construction ==================
 
@@ -1296,10 +1302,11 @@ class PCVRHyFormer(nn.Module):
             raise ValueError(f"Unknown ns_tokenizer_type: {ns_tokenizer_type}")
 
         # User dense feature projection (if available)
-        self.has_user_dense = user_dense_dim > 0
+        effective_user_dense_dim = user_dense_dim + context_time_dim
+        self.has_user_dense = effective_user_dense_dim > 0
         if self.has_user_dense:
             self.user_dense_proj = nn.Sequential(
-                nn.Linear(user_dense_dim, d_model),
+                nn.Linear(effective_user_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
 
@@ -1376,6 +1383,15 @@ class PCVRHyFormer(nn.Module):
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+
+        if seq_abs_time_dim > 0:
+            self.seq_abs_time_proj = nn.ModuleDict({
+                domain: nn.Sequential(
+                    nn.Linear(seq_abs_time_dim, d_model, bias=False),
+                    nn.LayerNorm(d_model),
+                )
+                for domain in self.seq_domains
+            })
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1550,6 +1566,8 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        abs_time_feats: Optional[torch.Tensor] = None,
+        abs_time_proj: Optional[nn.Module] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1572,6 +1590,11 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
 
+        if self.seq_abs_time_dim > 0:
+            assert abs_time_feats is not None, "seq_abs_time_dim > 0 requires abs_time_feats"
+            assert abs_time_proj is not None, "seq_abs_time_dim > 0 requires abs_time_proj"
+            token_emb = token_emb + abs_time_proj(abs_time_feats.float())
+
         return token_emb
 
     def _make_padding_mask(
@@ -1581,6 +1604,16 @@ class PCVRHyFormer(nn.Module):
         device = seq_len.device
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
+
+    def _merge_user_dense_time(
+        self,
+        user_dense_feats: torch.Tensor,
+        context_time_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        """Append sample-level absolute time features to user dense features."""
+        if self.context_time_dim <= 0:
+            return user_dense_feats
+        return torch.cat([user_dense_feats, context_time_feats.float()], dim=-1)
 
     def _run_multi_seq_blocks(
         self,
@@ -1640,7 +1673,9 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            user_dense_feats = self._merge_user_dense_time(
+                inputs.user_dense_feats, inputs.context_time_feats)
+            user_dense_tok = F.silu(self.user_dense_proj(user_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
@@ -1657,7 +1692,9 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_abs_time_feats[domain] if self.seq_abs_time_dim > 0 else None,
+                self.seq_abs_time_proj[domain] if self.seq_abs_time_dim > 0 else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1683,7 +1720,9 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            user_dense_feats = self._merge_user_dense_time(
+                inputs.user_dense_feats, inputs.context_time_feats)
+            user_dense_tok = F.silu(self.user_dense_proj(user_dense_feats)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
@@ -1699,7 +1738,9 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_abs_time_feats[domain] if self.seq_abs_time_dim > 0 else None,
+                self.seq_abs_time_proj[domain] if self.seq_abs_time_dim > 0 else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
