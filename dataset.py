@@ -131,6 +131,51 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# Absolute timestamp feature vector:
+# [daily sin/cos, weekly sin/cos, 30-day sin/cos, yearly sin/cos,
+#  hour_norm, day_of_week_norm, is_weekend, timestamp_scaled].
+TIME_FEATURE_DIM = 12
+SECONDS_PER_DAY = 86400.0
+SECONDS_PER_WEEK = 7.0 * SECONDS_PER_DAY
+SECONDS_PER_30_DAYS = 30.0 * SECONDS_PER_DAY
+SECONDS_PER_YEAR = 365.0 * SECONDS_PER_DAY
+TIMESTAMP_SCALE = 1_000_000_000.0
+
+
+def build_time_features(
+    timestamps: "npt.NDArray[np.int64]",
+    valid_mask: Optional["npt.NDArray[np.bool_]"] = None,
+) -> "npt.NDArray[np.float32]":
+    """Build UTC calendar/cycle features from Unix-second timestamps."""
+    ts = np.asarray(timestamps, dtype=np.float64)
+    day_phase = np.mod(ts, SECONDS_PER_DAY) / SECONDS_PER_DAY
+    week_phase = np.mod(ts, SECONDS_PER_WEEK) / SECONDS_PER_WEEK
+    month_phase = np.mod(ts, SECONDS_PER_30_DAYS) / SECONDS_PER_30_DAYS
+    year_phase = np.mod(ts, SECONDS_PER_YEAR) / SECONDS_PER_YEAR
+
+    hour = np.floor(np.mod(ts, SECONDS_PER_DAY) / 3600.0)
+    day_index = np.floor(ts / SECONDS_PER_DAY)
+    day_of_week = np.mod(day_index + 4.0, 7.0)  # Unix epoch was Thursday.
+
+    features = np.stack([
+        np.sin(2.0 * np.pi * day_phase),
+        np.cos(2.0 * np.pi * day_phase),
+        np.sin(2.0 * np.pi * week_phase),
+        np.cos(2.0 * np.pi * week_phase),
+        np.sin(2.0 * np.pi * month_phase),
+        np.cos(2.0 * np.pi * month_phase),
+        np.sin(2.0 * np.pi * year_phase),
+        np.cos(2.0 * np.pi * year_phase),
+        hour / 23.0,
+        day_of_week / 6.0,
+        (day_of_week >= 5.0).astype(np.float64),
+        ts / TIMESTAMP_SCALE,
+    ], axis=-1).astype(np.float32)
+
+    if valid_mask is not None:
+        features *= np.asarray(valid_mask, dtype=np.float32)[..., None]
+    return features
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -222,14 +267,17 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_int = np.zeros((B, self.user_int_schema.total_dim), dtype=np.int64)
         self._buf_item_int = np.zeros((B, self.item_int_schema.total_dim), dtype=np.int64)
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
+        self._buf_context_time = np.zeros((B, TIME_FEATURE_DIM), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
+        self._buf_seq_abs_time = {}
         self._buf_seq_lens = {}
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_abs_time[domain] = np.zeros((B, max_len, TIME_FEATURE_DIM), dtype=np.float32)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
@@ -520,6 +568,8 @@ class PCVRParquetDataset(IterableDataset):
 
         # ---- meta ----
         timestamps = batch.column(self._col_idx['timestamp']).to_numpy().astype(np.int64)
+        context_time = self._buf_context_time[:B]
+        context_time[:] = build_time_features(timestamps, timestamps > 0)
         if self.is_training:
             labels = (batch.column(self._col_idx['label_type']).fill_null(0)
                       .to_numpy(zero_copy_only=False).astype(np.int64) == 2).astype(np.int64)
@@ -587,6 +637,7 @@ class PCVRParquetDataset(IterableDataset):
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
             'item_int_feats': torch.from_numpy(item_int.copy()),
             'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
+            'context_time_feats': torch.from_numpy(context_time.copy()),
             'label': torch.from_numpy(labels),
             'timestamp': torch.from_numpy(timestamps),
             'user_id': user_ids,
@@ -642,6 +693,8 @@ class PCVRParquetDataset(IterableDataset):
             # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
+            abs_time_feats = self._buf_seq_abs_time[domain][:B]
+            abs_time_feats[:] = 0
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
@@ -675,8 +728,10 @@ class PCVRParquetDataset(IterableDataset):
                 buckets = raw_buckets.reshape(B, max_len) + 1
                 buckets[ts_padded == 0] = 0
                 time_bucket[:] = buckets
+                abs_time_feats[:] = build_time_features(ts_padded, ts_padded > 0)
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            result[f'{domain}_abs_time_feats'] = torch.from_numpy(abs_time_feats.copy())
 
         return result
 
