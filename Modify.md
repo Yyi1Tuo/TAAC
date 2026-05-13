@@ -263,3 +263,21 @@ token_mixing/FFN         -> [B, T, d_model]
 ```
 
 旧 checkpoint 缺少 `use_block_senet` 时，`infer.py` fallback 为关闭，以保证 strict load 兼容。
+
+## 9. SENet v3：NS field-wise + RankMixer token-wise SENet
+
+`v3` 分支同时启用 v1 和 v2 两个 SENet 位置：
+
+- `RankMixerNSTokenizer` 内的 field-wise SENet
+- `RankMixerBlock` 内 token mixing 前的 token-wise SENet
+
+新增/启用参数：
+
+```bash
+--use_ns_senet / --no_ns_senet
+--use_block_senet / --no_block_senet
+--senet_reduction 4
+```
+
+两个 SENet 共用 `senet_reduction`。旧 checkpoint 缺少 SENet 字段时，`infer.py` fallback
+为关闭，以保证 strict load 兼容。

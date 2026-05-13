@@ -81,6 +81,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--compile_mode', type=str, default='default',
                         choices=['default', 'reduce-overhead', 'max-autotune'],
                         help='torch.compile mode')
+    parser.add_argument('--use_ns_senet', action='store_true', default=True,
+                        help='Enable field-wise SENet in RankMixer NS tokenizers')
+    parser.add_argument('--no_ns_senet', dest='use_ns_senet', action='store_false',
+                        help='Disable field-wise SENet in RankMixer NS tokenizers')
     parser.add_argument('--use_block_senet', action='store_true', default=True,
                         help='Enable token-wise SENet before RankMixer token mixing')
     parser.add_argument('--no_block_senet', dest='use_block_senet',
@@ -331,6 +335,7 @@ def main() -> None:
         "seq_id_threshold": args.seq_id_threshold,
         "context_time_dim": TIME_FEATURE_DIM if args.use_context_time_feats else 0,
         "seq_abs_time_dim": TIME_FEATURE_DIM if args.use_seq_abs_time_feats else 0,
+        "use_ns_senet": args.use_ns_senet,
         "use_block_senet": args.use_block_senet,
         "senet_reduction": args.senet_reduction,
         "ns_tokenizer_type": args.ns_tokenizer_type,
@@ -345,7 +350,7 @@ def main() -> None:
     num_ns = model.num_ns
     T = args.num_queries * num_sequences + num_ns
     logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
-    logging.info(f"SENet config: use_ns_senet=False, "
+    logging.info(f"SENet config: use_ns_senet={args.use_ns_senet}, "
                  f"use_block_senet={args.use_block_senet}, "
                  f"senet_reduction={args.senet_reduction}")
     logging.info(f"User NS groups: {user_ns_groups}")

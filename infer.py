@@ -67,6 +67,7 @@ _FALLBACK_MODEL_CFG = {
     'seq_id_threshold': 10000,
     'context_time_dim': 0,
     'seq_abs_time_dim': 0,
+    'use_ns_senet': False,
     'use_block_senet': False,
     'senet_reduction': 4,
     'ns_tokenizer_type': 'rankmixer',
