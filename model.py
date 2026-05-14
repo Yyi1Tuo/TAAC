@@ -99,6 +99,29 @@ def apply_rope_to_tensor(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+class TokenSENet(nn.Module):
+    """Token-wise SENet for reweighting query and NS tokens."""
+
+    def __init__(self, num_tokens: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden_dim = max(1, num_tokens // reduction)
+        self.fc1 = nn.Linear(num_tokens, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, num_tokens)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Reweight tokens.
+
+        Args:
+            tokens: Tensor of shape (B, T, D).
+        """
+        z = tokens.mean(dim=-1)
+        gate = self.fc2(F.silu(self.fc1(z)))
+        scale = 2.0 * torch.sigmoid(gate)
+        return tokens * scale.unsqueeze(-1)
+
+
 class SwiGLU(nn.Module):
     """SwiGLU activation: x1 * SiLU(x2)."""
 
@@ -331,12 +354,18 @@ class RankMixerBlock(nn.Module):
         n_total: int,  # T = Nq + Nns
         hidden_mult: int = 4,
         dropout: float = 0.0,
-        mode: str = 'full'  # 'full' | 'ffn_only' | 'none'
+        mode: str = 'full',  # 'full' | 'ffn_only' | 'none'
+        use_senet: bool = False,
+        senet_reduction: int = 4,
     ) -> None:
         super().__init__()
         self.T = n_total
         self.D = d_model
         self.mode = mode
+        self.token_senet = (
+            TokenSENet(n_total, reduction=senet_reduction)
+            if use_senet else None
+        )
 
         if mode == 'none':
             # Pure identity mapping, no submodules created
@@ -394,6 +423,9 @@ class RankMixerBlock(nn.Module):
         """
         if self.mode == 'none':
             return Q
+
+        if self.token_senet is not None:
+            Q = self.token_senet(Q)
 
         # Token Mixing (parameter-free rewire) or identity
         if self.mode == 'full':
@@ -869,7 +901,9 @@ class MultiSeqHyFormerBlock(nn.Module):
         dropout: float = 0.0,
         top_k: int = 50,
         causal: bool = False,
-        rank_mixer_mode: str = 'full'
+        rank_mixer_mode: str = 'full',
+        use_block_senet: bool = False,
+        senet_reduction: int = 4,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
@@ -908,7 +942,9 @@ class MultiSeqHyFormerBlock(nn.Module):
             n_total=n_total,
             hidden_mult=hidden_mult,
             dropout=dropout,
-            mode=rank_mixer_mode
+            mode=rank_mixer_mode,
+            use_senet=use_block_senet,
+            senet_reduction=senet_reduction,
         )
 
     def forward(
@@ -985,6 +1021,29 @@ class MultiSeqHyFormerBlock(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 # PCVRHyFormer Main Model
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+class FieldSENet(nn.Module):
+    """Field-wise SENet for reweighting feature embeddings."""
+
+    def __init__(self, num_fields: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden_dim = max(1, num_fields // reduction)
+        self.fc1 = nn.Linear(num_fields, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, num_fields)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, field_embs: torch.Tensor) -> torch.Tensor:
+        """Reweight field embeddings.
+
+        Args:
+            field_embs: Tensor of shape (B, F, E).
+        """
+        z = field_embs.mean(dim=-1)
+        gate = self.fc2(F.silu(self.fc1(z)))
+        scale = 2.0 * torch.sigmoid(gate)
+        return field_embs * scale.unsqueeze(-1)
 
 
 class GroupNSTokenizer(nn.Module):
@@ -1085,6 +1144,8 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        use_senet: bool = False,
+        senet_reduction: int = 4,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1095,6 +1156,8 @@ class RankMixerNSTokenizer(nn.Module):
             d_model: Output token dimension.
             num_ns_tokens: Number of NS tokens to produce (T segments).
             emb_skip_threshold: Skip embedding for features with vocab > threshold.
+            use_senet: Whether to apply field-wise SENet before chunking.
+            senet_reduction: Reduction ratio for SENet hidden dimension.
         """
         super().__init__()
         self.feature_specs = feature_specs
@@ -1102,6 +1165,7 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.use_senet = use_senet
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1126,6 +1190,10 @@ class RankMixerNSTokenizer(nn.Module):
         # Compute total embedding dim: sum of all fids across all groups
         total_num_fids = sum(len(g) for g in groups)
         total_emb_dim = total_num_fids * emb_dim
+        self.field_senet = (
+            FieldSENet(total_num_fids, reduction=senet_reduction)
+            if use_senet else None
+        )
 
         # Pad total_emb_dim to be divisible by num_ns_tokens
         self.chunk_dim = math.ceil(total_emb_dim / num_ns_tokens)
@@ -1144,7 +1212,8 @@ class RankMixerNSTokenizer(nn.Module):
         logging.info(
             f"RankMixerNSTokenizer: {total_num_fids} fids, "
             f"total_emb_dim={total_emb_dim}, chunk_dim={self.chunk_dim}, "
-            f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
+            f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}, "
+            f"use_senet={use_senet}"
         )
 
     def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
@@ -1176,7 +1245,10 @@ class RankMixerNSTokenizer(nn.Module):
                         fid_emb = (emb_all * mask).sum(dim=1) / count
                 all_embs.append(fid_emb)
 
-        cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
+        field_embs = torch.stack(all_embs, dim=1)  # (B, total_num_fids, emb_dim)
+        if self.field_senet is not None:
+            field_embs = self.field_senet(field_embs)
+        cat_emb = field_embs.reshape(field_embs.shape[0], -1)  # (B, total_emb_dim)
 
         # 2. Pad if needed
         if self._pad_size > 0:
@@ -1229,6 +1301,9 @@ class PCVRHyFormer(nn.Module):
         seq_id_threshold: int = 10000,
         context_time_dim: int = 0,
         seq_abs_time_dim: int = 0,
+        use_ns_senet: bool = False,
+        use_block_senet: bool = False,
+        senet_reduction: int = 4,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1250,6 +1325,9 @@ class PCVRHyFormer(nn.Module):
         self.ns_tokenizer_type = ns_tokenizer_type
         self.context_time_dim = context_time_dim
         self.seq_abs_time_dim = seq_abs_time_dim
+        self.use_ns_senet = use_ns_senet
+        self.use_block_senet = use_block_senet
+        self.senet_reduction = senet_reduction
 
         # ================== NS Tokens Construction ==================
 
@@ -1286,6 +1364,8 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                use_senet=use_ns_senet,
+                senet_reduction=senet_reduction,
             )
             num_user_ns = user_ns_tokens
 
@@ -1296,6 +1376,8 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=item_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                use_senet=use_ns_senet,
+                senet_reduction=senet_reduction,
             )
             num_item_ns = item_ns_tokens
         else:
@@ -1417,6 +1499,8 @@ class PCVRHyFormer(nn.Module):
                 top_k=seq_top_k,
                 causal=seq_causal,
                 rank_mixer_mode=rank_mixer_mode,
+                use_block_senet=use_block_senet,
+                senet_reduction=senet_reduction,
             )
             for _ in range(num_hyformer_blocks)
         ])
